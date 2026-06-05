@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Secrets
+*.env
+*.env.example
+
+# Generated artifacts
+policy_index.npz
+pipeline_output.jsonl
+
+# HuggingFace cache
+.cache/
+
+# Dataset
+crash_policies.jsonl
