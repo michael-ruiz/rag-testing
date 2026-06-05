@@ -26,7 +26,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Default model — strong instruction follower, freely available on HF API
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = os.getenv("HF_MODEL", "meta-llama/Llama-3.2-3B-Instruct")
+DEFAULT_MODEL = os.getenv("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
 SYSTEM_PROMPT = """You are the central navigation module for an autonomous driving policy. \
 Your primary objective is to maintain safe driving behavior by cross-referencing your \
