@@ -27,58 +27,89 @@ DATASET_NAME = "turing-motors/CoVLA-Dataset"
 CAPTION_KEY = "rich_caption"
 
 
+CAPTIONS_ARCHIVE = "captions.tar.gz"   # cached filename after download
+CAPTIONS_HF_FILE = "captions.tar.gz"   # filename in the HF dataset repo
+
+
+def _ensure_captions_archive(token: str | None) -> Path:
+    """Return local path to captions.tar.gz, downloading from HF if needed."""
+    local = Path(CAPTIONS_ARCHIVE)
+    if local.exists():
+        return local
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise ImportError("Run: pip install huggingface_hub")
+
+    print(f"[load_covla] Downloading {CAPTIONS_HF_FILE} from HuggingFace (~65MB, one-time)...")
+    path = hf_hub_download(
+        repo_id=DATASET_NAME,
+        filename=CAPTIONS_HF_FILE,
+        repo_type="dataset",
+        token=token,
+        local_dir=".",
+    )
+    return Path(path)
+
+
 def _iter_hf_streaming(
     split: str = "train",
     token: str | None = None,
     max_samples: int | None = None,
 ) -> Iterator[dict]:
-    """Stream captions directly from the HF dataset hub."""
-    try:
-        from datasets import load_dataset, Video, Image
-        from datasets import Features, Value, Sequence
-    except ImportError:
-        raise ImportError("Install the 'datasets' package: pip install datasets")
+    """
+    Read captions directly from CoVLA's captions.tar.gz archive.
+
+    The archive contains one JSONL per video: captions/<video_id>.jsonl
+    Each line is  {"<frame_idx>": {"rich_caption": "...", "plain_caption": "...", ...}}
+
+    This is completely video-free — no torchcodec required.
+    """
+    import json as _json
+    import tarfile
 
     hf_token = token or os.getenv("HF_TOKEN")
-    print(f"[load_covla] Streaming {DATASET_NAME} (split={split}) from HuggingFace...")
+    archive_path = _ensure_captions_archive(hf_token)
 
-    ds = load_dataset(
-        DATASET_NAME,
-        split=split,
-        streaming=True,
-        token=hf_token,
-    )
-
-    # Prevent video/image decoding (requires torchcodec) by casting those
-    # columns to decode=False before iteration starts.
-    if hasattr(ds, "features") and ds.features:
-        new_features = {}
-        patched = []
-        for col, feat in ds.features.items():
-            feat_type = getattr(feat, "_type", "")
-            if feat_type == "Video":
-                new_features[col] = Video(decode=False)
-                patched.append(col)
-            elif feat_type == "Image":
-                new_features[col] = Image(decode=False)
-                patched.append(col)
-            else:
-                new_features[col] = feat
-        if patched:
-            print(f"[load_covla] Disabled decode for columns: {patched}")
-            from datasets import Features as Feats
-            ds = ds.cast(Feats(new_features))
+    print(f"[load_covla] Reading captions from {archive_path} ...")
 
     yielded = 0
-    for i, sample in enumerate(ds):
-        caption = sample.get(CAPTION_KEY, "").strip()
-        if not caption:
-            continue  # skip rows with empty captions (don't count against limit)
-        frame_id = sample.get("frame_id", sample.get("vidname", f"row_{i:06d}"))
-        yield {"frame_id": str(frame_id), "rich_caption": caption}
-        yielded += 1
-        if max_samples is not None and yielded >= max_samples:
-            break
+    global_row = 0
+
+    with tarfile.open(archive_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            if max_samples is not None and yielded >= max_samples:
+                break
+            if not member.name.endswith(".jsonl"):
+                continue
+
+            # video_id is the stem of the filename: captions/<video_id>.jsonl
+            video_id = member.name.split("/")[-1].replace(".jsonl", "")
+
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                continue
+
+            for raw_line in fobj:
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                try:
+                    record = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+
+                # Each line: {"<frame_idx>": {caption fields}}
+                for frame_idx, fields in record.items():
+                    caption = (fields.get(CAPTION_KEY) or "").strip()
+                    global_row += 1
+                    if not caption:
+                        continue
+                    frame_id = f"{video_id}_{frame_idx}"
+                    yield {"frame_id": frame_id, "rich_caption": caption}
+                    yielded += 1
+                    if max_samples is not None and yielded >= max_samples:
+                        return
 
 
 def _iter_local_csv(path: Path, max_samples: int | None = None) -> Iterator[dict]:

@@ -13,6 +13,11 @@ __pycache__/
 # Generated artifacts
 policy_index.npz
 pipeline_output.jsonl
+results.jsonl
+
+# Downloaded dataset files (large)
+captions.tar.gz
+hf_cache/
 
 # HuggingFace cache
 .cache/
