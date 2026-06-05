@@ -26,7 +26,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Default model — strong instruction follower, freely available on HF API
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+DEFAULT_MODEL = os.getenv("HF_MODEL", "meta-llama/Llama-3.2-3B-Instruct")
 
 SYSTEM_PROMPT = """You are the central navigation module for an autonomous driving policy. \
 Your primary objective is to maintain safe driving behavior by cross-referencing your \
@@ -154,8 +154,10 @@ def run_inference(
         except Exception as e:
             last_error = e
             err_str = str(e)
-            # Retry on model-loading or rate-limit errors
-            if any(code in err_str for code in ("404", "503", "loading", "overloaded")):
+            # Only retry on transient model-loading or rate-limit errors (5xx)
+            # Do NOT retry on 400 bad request (wrong model, bad token, etc.)
+            is_transient = any(code in err_str for code in ("503", "loading", "overloaded")) and "400" not in err_str
+            if is_transient:
                 wait = retry_delay * attempt
                 print(f"[infer] Model loading/busy (attempt {attempt}/{max_retries}), retrying in {wait:.0f}s...")
                 time.sleep(wait)
