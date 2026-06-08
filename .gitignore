@@ -14,6 +14,8 @@ __pycache__/
 policy_index.npz
 pipeline_output.jsonl
 results.jsonl
+*.jsonl
+*json
 
 # Downloaded dataset files (large)
 captions.tar.gz
@@ -24,3 +26,8 @@ hf_cache/
 
 # Dataset
 crash_policies.jsonl
+
+*.md
+*.jpg
+*.png
+*.log

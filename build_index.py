@@ -1,8 +1,12 @@
 """
 build_index.py
 --------------
-Embeds all policy strings from crash_policies.jsonl using
+Embeds all structured triplet policies from crash_policies.jsonl using
 sentence-transformers and saves a fast-lookup index to policy_index.npz.
+
+Each policy produces TWO embeddings:
+  - key_embedding:   encodes the "trigger" field only (used for retrieval)
+  - value_embedding: encodes "latent_risk" + " " + "mitigation" (passed to LLM)
 
 Usage:
     python build_index.py
@@ -18,22 +22,43 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 
-def load_policies(jsonl_path: Path) -> tuple[list[str], list[str]]:
-    """Load policy strings and video IDs from a JSONL file."""
-    policies, vidnames = [], []
+def load_policies(jsonl_path: Path) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Load structured triplet policies from a JSONL file.
+
+    Returns (triggers, latent_risks, mitigations, vidnames).
+    Skips entries that have an "error" key or are missing any required field.
+    """
+    triggers, latent_risks, mitigations, vidnames = [], [], [], []
+    required_keys = {"trigger", "latent_risk", "mitigation"}
+
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             record = json.loads(line)
+
+            # Skip errored entries
             if record.get("error") is not None:
-                continue  # skip errored entries
-            policy = record.get("policy", "").strip()
-            if policy:
-                policies.append(policy)
-                vidnames.append(record.get("vidname", "unknown"))
-    return policies, vidnames
+                continue
+
+            # Skip entries missing any required field
+            if not required_keys.issubset(record.keys()):
+                continue
+
+            trigger = record["trigger"].strip()
+            latent_risk = record["latent_risk"].strip()
+            mitigation = record["mitigation"].strip()
+
+            if not trigger or not latent_risk or not mitigation:
+                continue
+
+            triggers.append(trigger)
+            latent_risks.append(latent_risk)
+            mitigations.append(mitigation)
+            vidnames.append(record.get("clip_id", record.get("vidname", "unknown")))
+
+    return triggers, latent_risks, mitigations, vidnames
 
 
 def build_index(
@@ -43,29 +68,44 @@ def build_index(
     batch_size: int = 64,
 ) -> None:
     print(f"[build_index] Loading policies from: {jsonl_path}")
-    policies, vidnames = load_policies(jsonl_path)
-    print(f"[build_index] Found {len(policies)} valid policies.")
+    triggers, latent_risks, mitigations, vidnames = load_policies(jsonl_path)
+    print(f"[build_index] Found {len(triggers)} valid triplet policies.")
 
     print(f"[build_index] Loading embedding model: {model_name}")
     model = SentenceTransformer(model_name)
 
-    print("[build_index] Encoding policies (this may take a minute on first run)...")
-    embeddings = model.encode(
-        policies,
+    # Key embeddings — encode triggers only (used for retrieval)
+    print("[build_index] Encoding key embeddings (triggers)...")
+    key_embeddings = model.encode(
+        triggers,
         batch_size=batch_size,
         show_progress_bar=True,
         normalize_embeddings=True,  # cosine sim = dot product after normalization
         convert_to_numpy=True,
     )
 
+    # Value embeddings — encode latent_risk + mitigation (passed to LLM)
+    print("[build_index] Encoding value embeddings (latent_risk + mitigation)...")
+    value_texts = [f"{lr} {mt}" for lr, mt in zip(latent_risks, mitigations)]
+    value_embeddings = model.encode(
+        value_texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+
     np.savez(
         out_path,
-        embeddings=embeddings.astype(np.float32),
-        policies=np.array(policies, dtype=object),
+        key_embeddings=key_embeddings.astype(np.float32),
+        value_embeddings=value_embeddings.astype(np.float32),
+        triggers=np.array(triggers, dtype=object),
+        latent_risks=np.array(latent_risks, dtype=object),
+        mitigations=np.array(mitigations, dtype=object),
         vidnames=np.array(vidnames, dtype=object),
         model_name=np.array([model_name]),
     )
-    print(f"[build_index] Index saved to: {out_path}  ({len(policies)} entries)")
+    print(f"[build_index] Index saved to: {out_path}  ({len(triggers)} entries)")
 
 
 def main():

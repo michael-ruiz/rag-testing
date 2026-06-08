@@ -16,8 +16,8 @@ FLAGS:
     --interactive           Run in interactive CLI mode
     --captions FILE         Path to local CSV or JSONL captions file
     --output FILE           Output JSONL file (default: pipeline_output.jsonl)
-    --model MODEL_ID        HF model for inference (default: HuggingFaceH4/zephyr-7b-beta)
-    --token TOKEN           HF API token (overrides .env HF_TOKEN)
+    --model MODEL_ID        Groq model for inference (default: llama-3.1-8b-instant)
+    --token TOKEN           Groq API token (overrides .env GROQ_API_KEY)
     --top-k INT             Number of policies to retrieve (default: 1)
     --index FILE            Path to policy index (default: policy_index.npz)
     --max-samples INT       Max captions to process in batch mode (default: all)
@@ -46,8 +46,8 @@ def get_args():
     parser.add_argument("--interactive", action="store_true", help="Run interactive CLI mode")
     parser.add_argument("--captions", type=Path, default=None, help="Local captions file (CSV or JSONL)")
     parser.add_argument("--output", type=Path, default=Path("pipeline_output.jsonl"), help="Output JSONL file")
-    parser.add_argument("--model", type=str, default=None, help="HF model ID for inference")
-    parser.add_argument("--token", type=str, default=None, help="HuggingFace API token")
+    parser.add_argument("--model", type=str, default=None, help="Groq model ID for inference")
+    parser.add_argument("--token", type=str, default=None, help="Groq API token")
     parser.add_argument("--top-k", type=int, default=1, help="Number of policies to retrieve")
     parser.add_argument("--index", type=Path, default=Path("policy_index.npz"), help="Policy index file")
     parser.add_argument("--max-samples", type=int, default=None, help="Max captions to process")
@@ -62,43 +62,46 @@ def load_components(args):
     from infer import run_inference, DEFAULT_MODEL
 
     retriever = PolicyRetriever(index_path=args.index)
-    model_id = args.model or os.getenv("HF_MODEL", DEFAULT_MODEL)
-    hf_token = args.token or os.getenv("HF_TOKEN")
+    model_id = args.model or os.getenv("GROQ_MODEL", DEFAULT_MODEL)
+    api_key = args.token or os.getenv("GROQ_API_KEY")
 
-    if not hf_token:
+    if not api_key:
         print(
-            "[ERROR] HF_TOKEN is not set.\n"
-            "Copy .env.example to .env and add your HuggingFace token.\n"
-            "Get one at: https://huggingface.co/settings/tokens"
+            "[ERROR] GROQ_API_KEY is not set.\n"
+            "Add your Groq API token to .env"
         )
         sys.exit(1)
 
-    return retriever, model_id, hf_token, run_inference
+    return retriever, model_id, api_key, run_inference
 
 
-def run_single(caption: str, retriever, model_id: str, hf_token: str, run_inference, top_k: int = 1) -> dict:
+def run_single(caption: str, retriever, model_id: str, api_key: str, run_inference, top_k: int = 1) -> dict:
     """Run the full pipeline for one caption: retrieve -> infer -> return result."""
     retrieved = retriever.retrieve(caption, top_k=top_k)
     top_policy = retrieved[0]  # always use rank-1 for inference
 
     result = run_inference(
         caption=caption,
-        policy=top_policy["policy"],
+        trigger=top_policy["trigger"],
+        latent_risk=top_policy["latent_risk"],
+        mitigation=top_policy["mitigation"],
         model_id=model_id,
-        hf_token=hf_token,
+        api_key=api_key,
     )
 
     # Attach retrieval metadata to output
     result["_meta"] = {
         "retrieved_vidname": top_policy["vidname"],
         "retrieved_score": round(top_policy["score"], 4),
-        "retrieved_policy": top_policy["policy"],
+        "retrieved_trigger": top_policy["trigger"],
+        "retrieved_latent_risk": top_policy["latent_risk"],
+        "retrieved_mitigation": top_policy["mitigation"],
         "caption_preview": caption[:120],
     }
     return result
 
 
-def interactive_mode(retriever, model_id, hf_token, run_inference, top_k, args):
+def interactive_mode(retriever, model_id, api_key, run_inference, top_k, args):
     from load_covla import load_captions
 
     print("\n" + "=" * 60)
@@ -112,7 +115,7 @@ def interactive_mode(retriever, model_id, hf_token, run_inference, top_k, args):
     caption_iter = load_captions(
         local_path=args.captions,
         hf_split=args.hf_split,
-        hf_token=hf_token,
+        hf_token=os.getenv("HF_TOKEN"),
         max_samples=args.max_samples,
     )
 
@@ -130,16 +133,18 @@ def interactive_mode(retriever, model_id, hf_token, run_inference, top_k, args):
         retrieved = retriever.retrieve(caption, top_k=top_k)
         top_policy = retrieved[0]
         print(f"[retrieve] score={top_policy['score']:.4f}  vid={top_policy['vidname']}")
-        print(f"[retrieve] {top_policy['policy'][:100]}...\n")
+        print(f"[retrieve] trigger: {top_policy['trigger'][:100]}...\n")
 
         # -- Run gated inference --------------------------------------------
         print("[infer]    Calling HF API...")
         try:
             result = run_inference(
                 caption=caption,
-                policy=top_policy["policy"],
+                trigger=top_policy["trigger"],
+                latent_risk=top_policy["latent_risk"],
+                mitigation=top_policy["mitigation"],
                 model_id=model_id,
-                hf_token=hf_token,
+                api_key=api_key,
             )
         except Exception as e:
             print(f"[ERROR] Inference failed: {e}\n")
@@ -162,7 +167,7 @@ def interactive_mode(retriever, model_id, hf_token, run_inference, top_k, args):
         print()
 
 
-def batch_mode(args, retriever, model_id, hf_token, run_inference):
+def batch_mode(args, retriever, model_id, api_key, run_inference):
     from load_covla import load_captions
 
     print(f"\n[pipeline] Batch mode -> output: {args.output}")
@@ -171,7 +176,7 @@ def batch_mode(args, retriever, model_id, hf_token, run_inference):
     caption_iter = load_captions(
         local_path=args.captions,
         hf_split=args.hf_split,
-        hf_token=hf_token,
+        hf_token=os.getenv("HF_TOKEN"),
         max_samples=args.max_samples,
     )
 
@@ -188,7 +193,7 @@ def batch_mode(args, retriever, model_id, hf_token, run_inference):
                     caption=caption,
                     retriever=retriever,
                     model_id=model_id,
-                    hf_token=hf_token,
+                    api_key=api_key,
                     run_inference=run_inference,
                     top_k=args.top_k,
                 )
@@ -228,10 +233,10 @@ def main():
         )
         sys.exit(1)
 
-    retriever, model_id, hf_token, run_inference = load_components(args)
+    retriever, model_id, api_key, run_inference = load_components(args)
 
     if args.interactive:
-        interactive_mode(retriever, model_id, hf_token, run_inference, top_k=args.top_k, args=args)
+        interactive_mode(retriever, model_id, api_key, run_inference, top_k=args.top_k, args=args)
     else:
         if args.captions is None and not os.getenv("HF_TOKEN"):
             print(
