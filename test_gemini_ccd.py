@@ -98,15 +98,22 @@ def main():
     
     # Load environment variables
     load_dotenv(override=True)
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        print("Error: GEMINI_API_KEY not found in .env")
+    api_keys = [
+        os.getenv("GEM_KEY0"),
+        os.getenv("GEM_KEY1"),
+        os.getenv("GEM_KEY2")
+    ]
+    api_keys = [k for k in api_keys if k]
+    if not api_keys:
+        print("Error: No GEM_KEYs found in .env")
         return
         
-    print("API Key loaded successfully.")
+    print(f"{len(api_keys)} API Keys loaded successfully.")
+    
+    current_key_idx = 0
     
     # Configure Gemini
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=api_keys[current_key_idx])
     model = genai.GenerativeModel(MODEL_NAME)
     
     # Load already processed clips to allow resuming
@@ -204,8 +211,11 @@ def main():
                 except Exception as e:
                     error_str = str(e)
                     if "429" in error_str or "Quota Exceeded" in error_str:
-                        print(f"  -> Rate limited (429). Retrying in {RETRY_DELAY} seconds... (Attempt {attempt+1}/{MAX_RETRIES})")
-                        time.sleep(RETRY_DELAY)
+                        current_key_idx = (current_key_idx + 1) % len(api_keys)
+                        print(f"  -> Rate limited (429/Quota). Switching to API key index {current_key_idx}... (Attempt {attempt+1}/{MAX_RETRIES})")
+                        genai.configure(api_key=api_keys[current_key_idx])
+                        model = genai.GenerativeModel(MODEL_NAME)
+                        time.sleep(2)
                     else:
                         print(f"  -> API Error on {clip_id}: {e}")
                         time.sleep(5) # Small wait on other errors before retrying
