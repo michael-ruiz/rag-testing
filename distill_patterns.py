@@ -10,6 +10,8 @@ Usage:
     python distill_patterns.py --policies crash_policies.jsonl \
         --index policy_index.npz --out abstract_patterns.jsonl \
         --distilled-index distilled_index.npz
+    python distill_patterns.py --skip-synthesis   # rebuild index without API calls
+    python distill_patterns.py --dry-run          # preview LLM vs curated names, no writes
 """
 
 import argparse
@@ -19,8 +21,8 @@ import re
 import time
 from pathlib import Path
 
+import google.generativeai as genai
 import numpy as np
-import requests
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
@@ -30,11 +32,51 @@ from tqdm import tqdm
 load_dotenv()
 
 MODEL_NAME = "all-MiniLM-L6-v2"
-GROQ_MODEL = "llama-3.1-8b-instant"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 K_VALUES = [15, 20, 25, 30, 35, 40, 50]
 CENTROID_TOP_N = 8
-GROQ_DELAY = 0.5
+CALL_DELAY = 4.0  # 15 RPM free-tier cap → 60/15 = 4s minimum between calls
+
+# All 35 patterns must have entries here to ensure full reproducibility
+# across re-runs. If k changes and new pattern IDs are created, add
+# curated names for the new IDs before re-running.
+PATTERN_NAME_OVERRIDES: dict[str, str] = {
+    "P000": "Abrupt Lead Vehicle Deceleration",
+    "P001": "Unprotected Left Turn Collision",
+    "P002": "Oncoming Traffic on Icy Narrow Roads",
+    "P003": "Unexpected Lead Vehicle Stop",
+    "P004": "Unsignalized Lateral Lane Encroachment",
+    "P005": "Icy Road Lead Vehicle Braking",
+    "P006": "Failure to Yield to Pedestrians",
+    "P007": "Motorcyclist Following Distance Risk",
+    "P008": "Abrupt Lateral Lane Intrusion",
+    "P009": "Insufficient Following Distance in Wet Conditions",
+    "P010": "Slippery Surface Stopping Distance Deficit",
+    "P011": "Unsafe Overtaking Maneuver Conflict",
+    "P012": "Insufficient Following Distance at Intersections",
+    "P013": "Large Vehicle Encroachment Hazards",
+    "P014": "Oncoming Overtaking Encroachment Risk",
+    "P015": "Nighttime Intersection Crossing Collision",
+    "P016": "Vulnerable Road User Encroachment",
+    "P017": "Multi-Lane Congestion Cascade Braking",
+    "P018": "Oncoming Passing in Low-Traction Conditions",
+    "P019": "Merging Vehicle Speed Adaptation Failure",
+    "P020": "Visual Obstruction Induced Risk",
+    "P021": "Unsafe Overtaking and Following Dynamics",
+    "P022": "Ego-Path Left Turn Yield Failure",
+    "P023": "Low Visibility Snow Road Following",
+    "P024": "High-Speed Following Distance Deficit",
+    "P025": "Large Bus Visibility Obstruction",
+    "P026": "Slippery Intersection Encroachment Failure",
+    "P027": "Unsafe Lateral Lane Encroachment",
+    "P028": "Cross-Traffic Intersection Yield Failure",
+    "P029": "Insufficient Following Distance Behind Large Vehicles",
+    "P030": "Obstructed Pedestrian Crossing Collision",
+    "P031": "Unpredictable Roadside Hazard Encounter",
+    "P032": "Insufficient Following Distance in Glare Conditions",
+    "P033": "Insufficient Following Distance on Low-Traction Roads",
+    "P034": "Side Road Right-of-Way Violation",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +125,7 @@ def run_clustering(embeddings: np.ndarray, k_values: list[int], seed: int = 42) 
 
 
 # ---------------------------------------------------------------------------
-# Groq synthesis
+# Gemini synthesis
 # ---------------------------------------------------------------------------
 
 SYNTHESIS_SYSTEM = (
@@ -133,35 +175,30 @@ def extract_json(text: str) -> dict:
     raise ValueError(f"Could not extract JSON from:\n{text}")
 
 
-def call_groq(prompt: str, api_key: str, max_retries: int = 3) -> dict:
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": SYNTHESIS_SYSTEM},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 512,
-        "temperature": 0.2,
-    }
+def _parse_retry_delay(err: Exception) -> float | None:
+    """Extract suggested retry_delay seconds from a Gemini 429 error string."""
+    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", str(err))
+    return float(m.group(1)) + 2.0 if m else None
+
+
+def call_gemini(prompt: str, model: genai.GenerativeModel, max_retries: int = 5) -> dict:
+    full_prompt = f"{SYNTHESIS_SYSTEM}\n\n{prompt}"
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"]
-            return extract_json(raw)
+            response = model.generate_content(full_prompt)
+            return extract_json(response.text.strip())
         except Exception as e:
             last_err = e
             err_str = str(e)
-            is_transient = any(c in err_str for c in ("503", "429", "loading", "overloaded")) and "400" not in err_str
-            if is_transient and attempt < max_retries:
-                wait = 15.0 * attempt
-                print(f"  [groq] Transient error (attempt {attempt}/{max_retries}), retrying in {wait:.0f}s...")
-                time.sleep(wait)
+            if "429" in err_str:
+                wait = _parse_retry_delay(e) or 60.0
             else:
-                raise
-    raise RuntimeError(f"Groq failed after {max_retries} attempts: {last_err}")
+                wait = 5.0 * (2 ** (attempt - 1))  # 5s, 10s, 20s, ...
+            print(f"  [gemini] Error (attempt {attempt}/{max_retries}), retrying in {wait:.0f}s: {err_str[:120]}")
+            if attempt < max_retries:
+                time.sleep(wait)
+    raise RuntimeError(f"Gemini failed after {max_retries} attempts: {last_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +216,59 @@ def embed_texts(texts: list[str], model: SentenceTransformer, batch_size: int = 
 
 
 # ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def apply_overrides(patterns: list[dict]) -> int:
+    """Apply PATTERN_NAME_OVERRIDES in-place; return count of overrides applied."""
+    count = 0
+    for p in patterns:
+        name = PATTERN_NAME_OVERRIDES.get(p["pattern_id"])
+        if name:
+            p["pattern_name"] = name
+            count += 1
+    return count
+
+
+def save_index(patterns: list[dict], out_path: Path, st_model: SentenceTransformer) -> None:
+    pattern_triggers = [p["trigger"] for p in patterns]
+    pattern_value_texts = [f"{p['latent_risk']} {p['mitigation']}" for p in patterns]
+
+    print("[distill] Encoding key embeddings (canonical triggers)...")
+    distilled_keys = embed_texts(pattern_triggers, st_model)
+
+    print("[distill] Encoding value embeddings (latent_risk + mitigation)...")
+    distilled_values = embed_texts(pattern_value_texts, st_model)
+
+    np.savez(
+        out_path,
+        key_embeddings=distilled_keys,
+        value_embeddings=distilled_values,
+        triggers=np.array(pattern_triggers, dtype=object),
+        latent_risks=np.array([p["latent_risk"] for p in patterns], dtype=object),
+        mitigations=np.array([p["mitigation"] for p in patterns], dtype=object),
+        vidnames=np.array([p["pattern_id"] for p in patterns], dtype=object),
+        pattern_names=np.array([p["pattern_name"] for p in patterns], dtype=object),
+        model_name=np.array([MODEL_NAME]),
+    )
+    print(f"[distill] Distilled index saved to: {out_path}")
+
+
+def print_reproducibility(seed: int, best_k: int, best_sil: float,
+                          n_policies: int, n_patterns: int, n_overrides: int) -> None:
+    compression = n_policies / n_patterns if n_patterns else 0.0
+    print("\n=== REPRODUCIBILITY ===")
+    print(f"Random seed : {seed}")
+    print(f"Best k      : {best_k}")
+    print(f"Silhouette  : {best_sil:.4f}")
+    print(f"Policies    : {n_policies}")
+    print(f"Patterns    : {n_patterns}")
+    print(f"Compression : {compression:.1f}x")
+    print(f"Overrides   : {n_overrides}/{n_patterns} applied")
+    print("=======================")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -190,11 +280,51 @@ def main():
     parser.add_argument("--distilled-index", type=Path, default=Path("distilled_index.npz"))
     parser.add_argument("--clustering-results", type=Path, default=Path("clustering_results.json"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--skip-synthesis", action="store_true",
+        help="Skip Gemini API calls entirely. Load existing abstract_patterns.jsonl, "
+             "re-apply overrides, and rebuild distilled_index.npz.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Run clustering and synthesis, print LLM vs curated names, write no output files.",
+    )
     args = parser.parse_args()
 
-    api_key = os.getenv("GROQ_API_KEY")
+    # -----------------------------------------------------------------------
+    # --skip-synthesis: load existing patterns, reapply overrides, rebuild index
+    # -----------------------------------------------------------------------
+    if args.skip_synthesis:
+        print("[distill] --skip-synthesis: loading existing patterns from:", args.out)
+        patterns = [json.loads(l) for l in args.out.read_text(encoding="utf-8").splitlines() if l.strip()]
+        n_overrides = apply_overrides(patterns)
+        print(f"[distill] Applied {n_overrides} curated name overrides.")
+
+        args.out.write_text(
+            "\n".join(json.dumps(p, ensure_ascii=False) for p in patterns) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[distill] Saved updated patterns to: {args.out}")
+
+        print(f"\n[distill] Building distilled index with {MODEL_NAME}...")
+        st_model = SentenceTransformer(MODEL_NAME)
+        save_index(patterns, args.distilled_index, st_model)
+
+        n_policies = sum(p["cluster_size"] for p in patterns)
+        print_reproducibility(
+            seed=args.seed, best_k=len(patterns), best_sil=float("nan"),
+            n_policies=n_policies, n_patterns=len(patterns), n_overrides=n_overrides,
+        )
+        return
+
+    # -----------------------------------------------------------------------
+    # Normal / dry-run path: load policies and embeddings, cluster, synthesize
+    # -----------------------------------------------------------------------
+    api_key = os.getenv("GEM_KEY03")
     if not api_key:
-        raise EnvironmentError("GROQ_API_KEY not set. Add it to .env.")
+        raise EnvironmentError("GEM_KEY03 not set. Add it to .env.")
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
     # ---- Step 1: Load policies and embeddings ----
     print("[distill] Loading policies from:", args.policies)
@@ -211,7 +341,6 @@ def main():
             f"[distill] WARNING: index has {len(key_embeddings)} entries but JSONL has {n_original}. "
             "Using index order."
         )
-        # Clip to min length to stay aligned
         n = min(len(key_embeddings), n_original)
         key_embeddings = key_embeddings[:n]
         triggers = triggers[:n]
@@ -219,40 +348,45 @@ def main():
         mitigations = mitigations[:n]
         clip_ids = clip_ids[:n]
 
+    n_clustered = len(key_embeddings)
+
     # ---- Step 2: K-means sweep ----
     cluster_data = run_clustering(key_embeddings, K_VALUES, seed=args.seed)
 
-    # Print silhouette table
     print(f"\n{'k':>5}  {'silhouette':>12}")
     print("-" * 20)
     for k in K_VALUES:
         print(f"{k:>5}  {cluster_data[k]['silhouette']:>12.4f}")
 
-    # Save clustering results (without numpy arrays)
     clustering_out = {
         str(k): {"k": k, "silhouette": cluster_data[k]["silhouette"]}
         for k in K_VALUES
     }
-    with open(args.clustering_results, "w") as f:
-        json.dump(clustering_out, f, indent=2)
-    print(f"\n[distill] Clustering results saved to: {args.clustering_results}")
+    if not args.dry_run:
+        with open(args.clustering_results, "w") as f:
+            json.dump(clustering_out, f, indent=2)
+        print(f"\n[distill] Clustering results saved to: {args.clustering_results}")
 
     best_k = max(K_VALUES, key=lambda k: cluster_data[k]["silhouette"])
-    print(f"[distill] Best k={best_k} (silhouette={cluster_data[best_k]['silhouette']:.4f})")
+    best_sil = cluster_data[best_k]["silhouette"]
+    print(f"[distill] Best k={best_k} (silhouette={best_sil:.4f})")
 
     labels = np.array(cluster_data[best_k]["labels"])
-    centers = cluster_data[best_k]["centers"]  # shape (k, dim)
+    centers = cluster_data[best_k]["centers"]
 
     # ---- Step 3: Synthesize one pattern per cluster ----
-    print(f"\n[distill] Synthesizing {best_k} abstract patterns via Groq ({GROQ_MODEL})...")
+    if args.dry_run:
+        print(f"\n[distill] --dry-run: synthesizing {best_k} patterns (no files will be written)...")
+    else:
+        print(f"\n[distill] Synthesizing {best_k} abstract patterns via Gemini ({GEMINI_MODEL})...")
+
     patterns = []
 
     for cluster_id in tqdm(range(best_k), desc="Synthesizing clusters"):
         member_indices = np.where(labels == cluster_id)[0]
-        centroid = centers[cluster_id]  # already float64 from sklearn
+        centroid = centers[cluster_id]
 
-        # Cosine similarity: embeddings are L2-normalized, so dot product suffices
-        member_embs = key_embeddings[member_indices]  # (m, dim)
+        member_embs = key_embeddings[member_indices]
         centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-9)
         sims = member_embs @ centroid_norm
         top_idx = np.argsort(sims)[::-1][: min(CENTROID_TOP_N, len(member_indices))]
@@ -261,12 +395,22 @@ def main():
         policy_block = format_policy_block(closest_global, triggers, latent_risks, mitigations)
         prompt = SYNTHESIS_TEMPLATE.format(n=len(closest_global), policy_block=policy_block)
 
-        result = call_groq(prompt, api_key)
+        result = call_gemini(prompt, gemini_model)
+
+        pid = f"P{cluster_id:03d}"
+        llm_name = result.get("pattern_name", f"Pattern {cluster_id}")
+
+        if args.dry_run:
+            curated = PATTERN_NAME_OVERRIDES.get(pid)
+            if curated:
+                print(f'[{pid}] LLM: "{llm_name}" → CURATED: "{curated}"')
+            else:
+                print(f'[{pid}] LLM: "{llm_name}"')
 
         patterns.append(
             {
-                "pattern_id": f"P{cluster_id:03d}",
-                "pattern_name": result.get("pattern_name", f"Pattern {cluster_id}"),
+                "pattern_id": pid,
+                "pattern_name": llm_name,
                 "trigger": result.get("trigger", ""),
                 "latent_risk": result.get("latent_risk", ""),
                 "mitigation": result.get("mitigation", ""),
@@ -276,56 +420,50 @@ def main():
         )
 
         if cluster_id < best_k - 1:
-            time.sleep(GROQ_DELAY)
+            time.sleep(CALL_DELAY)
 
-    # ---- Step 4: Save abstract_patterns.jsonl ----
+    if args.dry_run:
+        print("\n[distill] --dry-run complete. No files written.")
+        print_reproducibility(
+            seed=args.seed, best_k=best_k, best_sil=best_sil,
+            n_policies=n_clustered, n_patterns=len(patterns),
+            n_overrides=sum(1 for p in patterns if p["pattern_id"] in PATTERN_NAME_OVERRIDES),
+        )
+        return
+
+    # ---- Step 4: Apply curated name overrides ----
+    n_overrides = apply_overrides(patterns)
+    print(f"[distill] Applied {n_overrides} curated name overrides.")
+
+    # ---- Step 5: Save abstract_patterns.jsonl ----
     with open(args.out, "w", encoding="utf-8") as f:
         for p in patterns:
             f.write(json.dumps(p) + "\n")
     print(f"[distill] Abstract patterns saved to: {args.out}")
 
-    # ---- Step 5: Build distilled index ----
+    # ---- Step 6: Build distilled index ----
     print(f"\n[distill] Building distilled index with {MODEL_NAME}...")
     st_model = SentenceTransformer(MODEL_NAME)
+    save_index(patterns, args.distilled_index, st_model)
 
-    pattern_triggers = [p["trigger"] for p in patterns]
-    pattern_value_texts = [f"{p['latent_risk']} {p['mitigation']}" for p in patterns]
-    pattern_names = [p["pattern_name"] for p in patterns]
-    pattern_ids = [p["pattern_id"] for p in patterns]
-
-    print("[distill] Encoding key embeddings (canonical triggers)...")
-    distilled_keys = embed_texts(pattern_triggers, st_model)
-
-    print("[distill] Encoding value embeddings (latent_risk + mitigation)...")
-    distilled_values = embed_texts(pattern_value_texts, st_model)
-
-    np.savez(
-        args.distilled_index,
-        key_embeddings=distilled_keys,
-        value_embeddings=distilled_values,
-        triggers=np.array(pattern_triggers, dtype=object),
-        latent_risks=np.array([p["latent_risk"] for p in patterns], dtype=object),
-        mitigations=np.array([p["mitigation"] for p in patterns], dtype=object),
-        vidnames=np.array(pattern_ids, dtype=object),
-        pattern_names=np.array(pattern_names, dtype=object),
-        model_name=np.array([MODEL_NAME]),
-    )
-    print(f"[distill] Distilled index saved to: {args.distilled_index}")
-
-    # ---- Step 6: Summary ----
+    # ---- Summary ----
     cluster_sizes = [p["cluster_size"] for p in patterns]
-    compression = n_original / len(patterns)
     print("\n" + "=" * 55)
     print("DISTILLATION SUMMARY")
     print("=" * 55)
     print(f"  Original corpus size : {n_original}")
     print(f"  Abstract patterns    : {len(patterns)}")
-    print(f"  Compression ratio    : {compression:.1f}x")
+    print(f"  Compression ratio    : {n_original / len(patterns):.1f}x")
     print(f"  Cluster sizes        : min={min(cluster_sizes)}  max={max(cluster_sizes)}  mean={np.mean(cluster_sizes):.1f}")
     print("\n  PATTERN NAMES:")
     for p in patterns:
         print(f"    [{p['pattern_id']}] {p['pattern_name']}  (n={p['cluster_size']})")
     print("=" * 55)
+
+    print_reproducibility(
+        seed=args.seed, best_k=best_k, best_sil=best_sil,
+        n_policies=n_clustered, n_patterns=len(patterns), n_overrides=n_overrides,
+    )
 
 
 if __name__ == "__main__":
